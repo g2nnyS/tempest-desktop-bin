@@ -1,0 +1,108 @@
+name: Update AUR package
+
+# 定时检查上游发布，发现新版本后自动更新 PKGBUILD/.SRCINFO 并推送到 AUR。
+# 需要的仓库 Secret:
+#   AUR_SSH_PRIVATE_KEY  已添加到 AUR 账户 SSH Public Key 的私钥（无口令）
+
+on:
+  schedule:
+    # 每 6 小时检查一次（UTC）
+    - cron: "23 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: aur-update
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    env:
+      PKGNAME: tempest-desktop-bin
+      AUR_BRANCH: master
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Detect upstream release and update PKGBUILD
+        id: upstream
+        run: bash .github/scripts/update-pkgbuild.sh
+
+      - name: Regenerate .SRCINFO
+        if: steps.upstream.outputs.updated == 'true'
+        run: |
+          # makepkg 不允许以 root 运行，这里用 runner 用户 (uid/gid) 在 Arch 容器内执行。
+          # archlinux:latest 已包含 makepkg，--printsrcinfo 不需要 base-devel 里的 fakeroot 等工具。
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp \
+            -v "$PWD:/pkg" \
+            -w /pkg \
+            archlinux:latest \
+            bash -c 'makepkg --printsrcinfo' > .SRCINFO
+          # 确保 .SRCINFO 确实反映了新版本（该行以制表符缩进）
+          grep -Eq "^[[:space:]]*pkgver = ${{ steps.upstream.outputs.pkgver }}$" .SRCINFO
+
+      - name: Commit changes
+        if: steps.upstream.outputs.updated == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: ${{ steps.upstream.outputs.pkgver }}-1（x86_64, aarch64）"
+
+      - name: Configure AUR SSH
+        if: steps.upstream.outputs.updated == 'true'
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "::error::Secret AUR_SSH_PRIVATE_KEY is not set"
+            exit 1
+          fi
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" | tr -d '\r' > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan -t ed25519,rsa aur.archlinux.org 2>/dev/null >> ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Push package files to AUR
+        if: steps.upstream.outputs.updated == 'true'
+        env:
+          NEW_PKGVER: ${{ steps.upstream.outputs.pkgver }}
+        run: |
+          # AUR 仓库不允许子目录，因此不能直接推送含 .github/ 的 GitHub 分支。
+          # 这里单独克隆 AUR 仓库，只更新 PKGBUILD 和 .SRCINFO 后提交。
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/aur -o IdentitiesOnly=yes"
+          aur_dir="$RUNNER_TEMP/aur-repo"
+          rm -rf "$aur_dir"
+          git clone --depth=1 "ssh://aur@aur.archlinux.org/${PKGNAME}.git" "$aur_dir"
+          cd "$aur_dir"
+
+          current_aur="$(sed -n 's/^pkgver=//p' PKGBUILD | head -n1)"
+          if [ "$current_aur" = "$NEW_PKGVER" ]; then
+            echo "AUR already at ${NEW_PKGVER}; skipping AUR push"
+            exit 0
+          fi
+          newest="$(printf '%s\n%s\n' "$current_aur" "$NEW_PKGVER" | sort -V | tail -n1)"
+          if [ "$newest" != "$NEW_PKGVER" ]; then
+            echo "::error::AUR has newer version ${current_aur}; refusing to downgrade"
+            exit 1
+          fi
+
+          cp "$GITHUB_WORKSPACE/PKGBUILD" "$GITHUB_WORKSPACE/.SRCINFO" .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add PKGBUILD .SRCINFO
+          git commit -m "upgpkg: ${NEW_PKGVER}-1（x86_64, aarch64）"
+          git push origin "HEAD:${AUR_BRANCH}"
+
+      - name: Push mirror to GitHub
+        if: steps.upstream.outputs.updated == 'true'
+        run: git push origin "HEAD:${GITHUB_REF_NAME}"
